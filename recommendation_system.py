@@ -5,6 +5,7 @@ from surprise.model_selection import train_test_split
 from surprise import accuracy
 import joblib
 import os
+from flask import Flask, jsonify
 
 # Kết nối PostgreSQL
 conn = psycopg2.connect(
@@ -80,7 +81,7 @@ print("Số lượng product_id duy nhất:", purchase_df['product_id'].nunique(
 # Chuẩn hóa rating về thang 0-5
 max_rating = (purchase_df['total_price'] / purchase_df['quantity']).max()
 purchase_df['rating'] = (purchase_df['total_price'] / purchase_df['quantity']) / max_rating * 5
-purchase_df['rating'] = purchase_df['rating'].clip(0, 5)  # Giới hạn từ 0 đến 5
+purchase_df['rating'] = purchase_df['rating'].clip(0, 5)
 
 # In dữ liệu để kiểm tra
 print("Kiểm tra dữ liệu rating trong purchase_df:")
@@ -94,20 +95,86 @@ data = Dataset.load_from_df(purchase_df[['customer_id', 'product_id', 'rating']]
 # Chia tập train và test
 trainset, testset = train_test_split(data, test_size=0.2, random_state=42)
 
-# Huấn luyện hoặc tải mô hình SVD
-model_file = "svd_model.pkl"
-if os.path.exists(model_file):
-    print("Tải mô hình đã huấn luyện từ file...")
-    model = joblib.load(model_file)
-else:
-    print("Huấn luyện mô hình mới...")
-    model = SVD(n_factors=50, n_epochs=20, lr_all=0.005, reg_all=0.02)
-    model.fit(trainset)
-    joblib.dump(model, model_file)
+# Hàm gợi ý sản phẩm giảm giá
+def get_discounted_recommendations(customer_id, n=5):
+    # Lấy danh mục yêu thích của khách hàng
+    fav_category = favorite_categories[favorite_categories['customer_id'] == customer_id]['category_id'].values[0]
+    
+    # Lấy danh sách sản phẩm đã mua của khách hàng
+    purchased_products = purchase_df[purchase_df['customer_id'] == customer_id]['product_id'].unique()
+    
+    # Lọc sản phẩm giảm giá trong danh mục yêu thích và chưa mua
+    discounted_products = products_df[
+        (products_df['category_id'] == fav_category) & 
+        (~products_df['product_id'].isin(purchased_products))
+    ].copy()
+    
+    if discounted_products.empty:
+        print(f"Không có sản phẩm giảm giá trong danh mục {fav_category} cho khách hàng {customer_id}. Mở rộng sang danh mục khác.")
+        related_categories = purchase_df[purchase_df['customer_id'] == customer_id]['category_id'].unique()
+        discounted_products = products_df[
+            (products_df['category_id'].isin(related_categories)) & 
+            (~products_df['product_id'].isin(purchased_products))
+        ].copy()
+    
+    # Dự đoán rating cho các sản phẩm
+    recommendations = []
+    for _, row in discounted_products.iterrows():
+        product_id = row['product_id']
+        pred = model.predict(customer_id, product_id)
+        recommendations.append((product_id, pred.est, row['discounted_price'], row['discount']))
+    
+    # Sắp xếp theo rating dự đoán
+    recommendations.sort(key=lambda x: x[1], reverse=True)
+    top_recs = recommendations[:n]
+    
+    # Tạo DataFrame kết quả
+    result = []
+    for product_id, est_rating, discounted_price, discount in top_recs:
+        product_info = products_df[products_df['product_id'] == product_id].iloc[0]
+        result.append({
+            'product_id': product_id,
+            'name': product_info['name'],
+            'category_id': product_info['category_id'],
+            'brand': product_info['brand'],
+            'price': product_info['price'],
+            'discounted_price': discounted_price,
+            'discount': discount,
+            'predicted_rating': est_rating
+        })
+    return pd.DataFrame(result)
 
-# Đánh giá mô hình (RMSE - Root Mean Squared Error)
-predictions = model.test(testset)
-print("RMSE:", accuracy.rmse(predictions))
+# Khởi tạo Flask
+app = Flask(__name__)
 
-# Đóng kết nối
-conn.close()
+@app.route('/recommend/<int:customer_id>', methods=['GET'])
+def recommend(customer_id):
+    try:
+        recommendations = get_discounted_recommendations(customer_id)
+        if recommendations.empty:
+            return jsonify({'error': 'Không tìm thấy gợi ý cho khách hàng này'}), 404
+        return jsonify(recommendations.to_dict(orient='records'))
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+if __name__ == '__main__':
+    # Huấn luyện hoặc tải mô hình trước khi chạy API
+    model_file = "svd_model.pkl"
+    if os.path.exists(model_file):
+        print("Tải mô hình đã huấn luyện từ file...")
+        model = joblib.load(model_file)
+    else:
+        print("Huấn luyện mô hình mới...")
+        model = SVD(n_factors=50, n_epochs=20, lr_all=0.005, reg_all=0.02)
+        model.fit(trainset)
+        joblib.dump(model, model_file)
+
+    # Đánh giá mô hình (RMSE - Root Mean Squared Error)
+    predictions = model.test(testset)
+    print("RMSE:", accuracy.rmse(predictions))
+
+    # Chạy API
+    app.run(debug=True, host='0.0.0.0', port=5000)
+
+    # Đóng kết nối
+    conn.close()
